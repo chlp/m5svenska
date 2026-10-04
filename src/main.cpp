@@ -62,11 +62,14 @@ static void drawFit(const char* s, int cx, int cy, int maxW, uint32_t color,
   for (int i = 0; i < (int)str.length(); i++)
     if (str[i] == ' ' && (best < 0 || abs(i - mid) < abs(best - mid))) best = i;
   useFont(last);
-  if (best < 0) {
-    cv.drawString(s, cx, cy);
+  int lh = cv.fontHeight();
+  if (best < 0) {  // длинное составное слово: режем посередине по границе UTF-8 и ставим дефис
+    int cut = mid;
+    while (cut > 0 && (str[cut] & 0xC0) == 0x80) cut--;
+    cv.drawString(str.substring(0, cut) + "-", cx, cy - lh / 2);
+    cv.drawString(str.substring(cut), cx, cy + lh / 2);
     return;
   }
-  int lh = cv.fontHeight();
   cv.drawString(str.substring(0, best), cx, cy - lh / 2);
   cv.drawString(str.substring(best + 1), cx, cy + lh / 2);
 }
@@ -84,6 +87,12 @@ Preferences prefs;
 static uint8_t level[WORD_COUNT];
 static int unsavedAnswers = 0;
 
+// Сложность: в игре участвуют только первые N самых частотных слов.
+static const int TIERS[] = {250, 1000, 10000};
+constexpr int TIER_COUNT = sizeof(TIERS) / sizeof(TIERS[0]);
+static int tier = 0;
+static int limit() { return min<int>(TIERS[tier], WORD_COUNT); }
+
 enum Screen { MENU, QUIZ, CARDS };
 static Screen screen = MENU;
 static bool dirty = true;
@@ -94,8 +103,9 @@ struct Rect {
 };
 
 // меню
-static const Rect MENU_TILES[4] = {{8, 62, 148, 84}, {164, 62, 148, 84},
-                                   {8, 152, 148, 84}, {164, 152, 148, 84}};
+static const Rect MENU_TILES[4] = {{8, 96, 148, 66}, {164, 96, 148, 66},
+                                   {8, 168, 148, 66}, {164, 168, 148, 66}};
+static const Rect TIER_BAR = {8, 58, 304, 30};
 
 // квиз
 enum QuizMode { SV_RU, RU_SV, MIX };
@@ -122,20 +132,33 @@ static const Rect AUTO_BTN = {230, 0, 90, 30};
 constexpr uint32_t AUTO_MS = 4000;
 
 // ---------------------------------------------------------------- прогресс
+// Уровни хранятся в NVS по 4 бита на слово. Индекс = ранг слова в words.h,
+// поэтому при пересборке словаря с другим порядком прогресс сбрасывается (ключ "lv4n").
+static uint8_t packed[(WORD_COUNT + 1) / 2];
+
 static void loadProgress() {
   prefs.begin("svenska", false);
+  prefs.remove("lvl");  // формат первой версии (355 слов)
   memset(level, 0, sizeof(level));
-  if (prefs.getBytesLength("lvl") == sizeof(level)) prefs.getBytes("lvl", level, sizeof(level));
+  if (prefs.getUShort("lv4n", 0) == WORD_COUNT &&
+      prefs.getBytesLength("lv4") == sizeof(packed)) {
+    prefs.getBytes("lv4", packed, sizeof(packed));
+    for (int i = 0; i < WORD_COUNT; i++) level[i] = (packed[i / 2] >> (i % 2 * 4)) & 0x0F;
+  }
+  tier = constrain(prefs.getUChar("tier", 0), 0, TIER_COUNT - 1);
 }
 
 static void saveProgress() {
-  prefs.putBytes("lvl", level, sizeof(level));
+  memset(packed, 0, sizeof(packed));
+  for (int i = 0; i < WORD_COUNT; i++) packed[i / 2] |= level[i] << (i % 2 * 4);
+  prefs.putBytes("lv4", packed, sizeof(packed));
+  prefs.putUShort("lv4n", WORD_COUNT);
   unsavedAnswers = 0;
 }
 
 static int learnedCount() {
   int n = 0;
-  for (int i = 0; i < WORD_COUNT; i++) n += level[i] >= 3;
+  for (int i = 0; i < limit(); i++) n += level[i] >= 3;
   return n;
 }
 
@@ -179,18 +202,19 @@ static bool isRecent(int idx) {
 }
 
 // Взвешенный случайный выбор: новые и ошибочные слова выпадают чаще.
+static uint32_t weight(int i) {
+  int k = MAX_LEVEL + 1 - level[i];
+  return isRecent(i) ? 0 : k * k;
+}
+
 static int pickWord() {
   uint32_t total = 0;
-  static uint16_t weight[WORD_COUNT];
-  for (int i = 0; i < WORD_COUNT; i++) {
-    int k = MAX_LEVEL + 1 - level[i];
-    weight[i] = isRecent(i) ? 0 : k * k;
-    total += weight[i];
-  }
+  for (int i = 0; i < limit(); i++) total += weight(i);
   uint32_t r = esp_random() % total;
-  for (int i = 0; i < WORD_COUNT; i++) {
-    if (r < weight[i]) return i;
-    r -= weight[i];
+  for (int i = 0; i < limit(); i++) {
+    uint32_t w = weight(i);
+    if (r < w) return i;
+    r -= w;
   }
   return 0;
 }
@@ -204,7 +228,7 @@ static void newQuestion() {
   int n = 0;
   int opts[4];
   for (int tries = 0; n < 3 && tries < 2000; tries++) {
-    int c = esp_random() % WORD_COUNT;
+    int c = esp_random() % limit();
     if (tries < 1500 && WORDS[c].pos != WORDS[qWord].pos) continue;
     bool bad = conflicts(c, qWord);
     for (int j = 0; j < n && !bad; j++) bad = conflicts(c, opts[j]);
@@ -223,14 +247,14 @@ static void startQuiz(QuizMode m) {
 }
 
 static void shuffleDeck() {
-  deck.resize(WORD_COUNT);
-  for (int i = 0; i < WORD_COUNT; i++) deck[i] = i;
-  for (int i = WORD_COUNT - 1; i > 0; i--) std::swap(deck[i], deck[esp_random() % (i + 1)]);
+  deck.resize(limit());
+  for (int i = 0; i < limit(); i++) deck[i] = i;
+  for (int i = limit() - 1; i > 0; i--) std::swap(deck[i], deck[esp_random() % (i + 1)]);
   cardPos = 0;
 }
 
 static void startCards() {
-  if (deck.empty()) shuffleDeck();
+  if ((int)deck.size() != limit()) shuffleDeck();
   screen = CARDS;
   cardShownAt = millis();
   dirty = true;
@@ -267,8 +291,20 @@ static void drawMenu() {
   drawSwedishFlag(12, 12);
   drawText("Svenska", 52, 22, F_B28, C_YELLOW, middle_left);
   char buf[48];
-  snprintf(buf, sizeof(buf), "%d ord · выучено %d", WORD_COUNT, learnedCount());
+  snprintf(buf, sizeof(buf), "выучено %d из %d", learnedCount(), limit());
   drawText(buf, 12, 46, F_R16, C_MUTED, middle_left);
+
+  // переключатель «топ N»
+  const Rect& b = TIER_BAR;
+  cv.fillRoundRect(b.x, b.y, b.w, b.h, 15, C_TILE);
+  cv.drawRoundRect(b.x, b.y, b.w, b.h, 15, C_TILE_EDGE);
+  int sw = b.w / TIER_COUNT;
+  for (int i = 0; i < TIER_COUNT; i++) {
+    int sx = b.x + i * sw;
+    if (i == tier) cv.fillRoundRect(sx + 2, b.y + 2, sw - 4, b.h - 4, 13, C_YELLOW);
+    snprintf(buf, sizeof(buf), "Топ %d", TIERS[i]);
+    drawText(buf, sx + sw / 2, b.y + b.h / 2, F_R16, i == tier ? C_BG : C_TEXT, middle_center);
+  }
 
   struct { const char* title; const char* sub; uint32_t accent; } tiles[4] = {
     {"SV \xE2\x86\x92 RU", "квиз", C_YELLOW},
@@ -280,11 +316,11 @@ static void drawMenu() {
     const Rect& r = MENU_TILES[i];
     cv.fillRoundRect(r.x, r.y, r.w, r.h, 12, C_TILE);
     cv.drawRoundRect(r.x, r.y, r.w, r.h, 12, C_TILE_EDGE);
-    cv.fillRoundRect(r.x + 10, r.y + 14, 4, r.h - 28, 2, tiles[i].accent);
+    cv.fillRoundRect(r.x + 10, r.y + 12, 4, r.h - 24, 2, tiles[i].accent);
     useFont(F_B28);
     FontId tf = cv.textWidth(tiles[i].title) <= r.w - 30 ? F_B28 : F_B22;
-    drawText(tiles[i].title, r.x + 22, r.y + 34, tf, C_TEXT, middle_left);
-    drawText(tiles[i].sub, r.x + 22, r.y + 62, F_R16, C_MUTED, middle_left);
+    drawText(tiles[i].title, r.x + 22, r.y + 26, tf, C_TEXT, middle_left);
+    drawText(tiles[i].sub, r.x + 22, r.y + 50, F_R16, C_MUTED, middle_left);
   }
 }
 
@@ -328,10 +364,10 @@ static void drawQuiz() {
 static void drawCards() {
   cv.fillScreen(C_BG);
   char buf[24];
-  snprintf(buf, sizeof(buf), "Kort  %d / %d", cardPos + 1, WORD_COUNT);
+  snprintf(buf, sizeof(buf), "Kort  %d / %d", cardPos + 1, limit());
   drawTopBar(buf);
   cv.fillRoundRect(AUTO_BTN.x + 22, 4, 62, 22, 11, autoPlay ? C_YELLOW : C_TILE);
-  drawText(autoPlay ? "авто" : "авто", AUTO_BTN.x + 53, 15, F_R16, autoPlay ? C_BG : C_MUTED, middle_center);
+  drawText("авто", AUTO_BTN.x + 53, 15, F_R16, autoPlay ? C_BG : C_MUTED, middle_center);
 
   int idx = deck[cardPos];
   const Word& w = WORDS[idx];
@@ -343,6 +379,10 @@ static void drawCards() {
   drawText("РУССКИЙ", 24, 134, F_R16, C_MUTED, middle_left);
   drawFit(w.ru, W / 2, 166, 284, C_TEXT, {F_B28, F_B22, F_R16});
   drawLevelDots(W - 52, 50, level[idx]);
+  // ранг по частоте и уровень CEFR
+  static const char* const CEFR[] = {"", "A1", "A2", "B1", "B2", "C1", "C2"};
+  snprintf(buf, sizeof(buf), "#%d %s", idx + 1, CEFR[w.cefr]);
+  drawText(buf, 120, 50, F_R16, C_MUTED, middle_left);
 
   drawText("\xE2\x80\xB9 назад", 14, 222, F_R16, C_MUTED, middle_left);
   drawText("далее \xE2\x80\xBA", W - 14, 222, F_R16, C_MUTED, middle_right);
@@ -368,6 +408,16 @@ static void render() {
 static void onTap(int x, int y) {
   switch (screen) {
     case MENU:
+      if (TIER_BAR.hit(x, y)) {
+        int t = constrain((x - TIER_BAR.x) * TIER_COUNT / TIER_BAR.w, 0, TIER_COUNT - 1);
+        if (t != tier) {
+          tier = t;
+          prefs.putUChar("tier", tier);
+          deck.clear();
+        }
+        dirty = true;
+        return;
+      }
       if (MENU_TILES[0].hit(x, y)) startQuiz(SV_RU);
       else if (MENU_TILES[1].hit(x, y)) startQuiz(RU_SV);
       else if (MENU_TILES[2].hit(x, y)) startQuiz(MIX);
@@ -410,8 +460,8 @@ static void onTap(int x, int y) {
         dirty = true;
         return;
       }
-      if (x < W / 3) cardPos = (cardPos + WORD_COUNT - 1) % WORD_COUNT;
-      else cardPos = (cardPos + 1) % WORD_COUNT;
+      if (x < W / 3) cardPos = (cardPos + limit() - 1) % limit();
+      else cardPos = (cardPos + 1) % limit();
       cardShownAt = millis();
       dirty = true;
       break;
@@ -486,7 +536,7 @@ void loop() {
 
   if (screen == CARDS && autoPlay) {
     if (now - cardShownAt >= AUTO_MS) {
-      cardPos = (cardPos + 1) % WORD_COUNT;
+      cardPos = (cardPos + 1) % limit();
       cardShownAt = now;
     }
     static uint32_t lastFrame = 0;
